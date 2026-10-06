@@ -18,7 +18,7 @@ python air_draw.py
 | Gesture | Action |
 |---|---|
 | Index finger up only | Draw |
-| Index + middle fingers up | Hover (move without drawing) |
+| Index + middle fingers up | Poke the colors buttons to switch colors |
 | Pinch (thumb + index) on a drawing | Grab and drag it; open your fingers to drop it |
 
 Pick a color by clicking a button with the mouse, hovering over it with two fingers, or pinching while your hand is over it.
