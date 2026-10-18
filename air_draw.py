@@ -1,5 +1,6 @@
 """
 Air Draw - draw in the air with your index finger using your webcam.
+Gruvbox edition.
 
 Gestures
   Index finger up only          -> DRAW
@@ -11,7 +12,7 @@ Gestures
 
 Keys
   s = save PNG    c = clear all    u = UNDO (stroke, erase, drag or clear)
-  + / - = brush size    q or ESC = quit
+  + / - = brush size    h = show key hints    q or ESC = quit
 """
 
 import time
@@ -21,7 +22,9 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-WIDTH, HEIGHT = 1920, 1080  # try 1280, 720 if your camera or PC struggles
+WIDTH, HEIGHT = 1280, 720   # canvas size (window is resizable, so scaling up is free)
+CAM_W, CAM_H = 1280, 720    # webcam capture size, only used for hand tracking
+SHOW_CAMERA = False         # False = black gruvbox canvas + hand skeleton only; True = show the camera
 SCALE = HEIGHT / 720        # sizes below scale with the resolution
 TOOLBAR_H = int(90 * SCALE)
 SMOOTHING = 0.5            # 0 = very smooth/laggy, 1 = raw/jittery
@@ -30,17 +33,59 @@ GRAB_RADIUS = int(50 * SCALE)  # how close (px) a pinch must be to a stroke to g
 PINCH_ON = 0.28            # pinch distance / hand size below this -> pinching
 PINCH_OFF = 0.40           # above this -> released (hysteresis avoids flicker)
 
+# --- look & feel ---------------------------------------------------------------------
+FEED_DIM = 0.55            # how much of the camera shows through (rest is gruvbox bg0)
+FEED_DESAT = 0.35          # 0 = full color camera, 1 = black & white
+GLOW_STRENGTH = 0.55       # 0 = no stroke glow
+HINT_SECONDS = 8.0         # how long the key hints stay up (they fade over the last 2s)
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+def hex_bgr(h):
+    """'#rrggbb' -> OpenCV BGR tuple."""
+    h = h.lstrip("#")
+    return (int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16))
+
+
+GRUV = {
+    "bg0":    hex_bgr("#282828"),
+    "bg1":    hex_bgr("#3c3836"),
+    "bg2":    hex_bgr("#504945"),
+    "fg":     hex_bgr("#ebdbb2"),
+    "gray":   hex_bgr("#928374"),
+    "red":    hex_bgr("#fb4934"),
+    "orange": hex_bgr("#fe8019"),
+    "yellow": hex_bgr("#fabd2f"),
+    "green":  hex_bgr("#b8bb26"),
+    "aqua":   hex_bgr("#8ec07c"),
+    "blue":   hex_bgr("#83a598"),
+    "purple": hex_bgr("#d3869b"),
+}
+
 # name, BGR color (None color = eraser)
 TOOLS = [
-    ("Red",    (0, 0, 255)),
-    ("Green",  (0, 200, 0)),
-    ("Blue",   (255, 80, 0)),
-    ("Yellow", (0, 230, 255)),
-    ("White",  (255, 255, 255)),
+    ("Red",    GRUV["red"]),
+    ("Orange", GRUV["orange"]),
+    ("Yellow", GRUV["yellow"]),
+    ("Green",  GRUV["green"]),
+    ("Aqua",   GRUV["aqua"]),
+    ("Blue",   GRUV["blue"]),
+    ("Purple", GRUV["purple"]),
+    ("Cream",  GRUV["fg"]),
 ]
+
+MODE_COLORS = {
+    "DRAW": GRUV["green"],
+    "HOVER": GRUV["yellow"],
+    "DRAGGING": GRUV["orange"],
+    "PINCH": GRUV["purple"],
+}
 
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
+LM_SPEC = mp_draw.DrawingSpec(color=GRUV["fg"], thickness=-1, circle_radius=max(int(2 * SCALE), 2))
+CONN_SPEC = mp_draw.DrawingSpec(color=GRUV["gray"], thickness=max(int(1.5 * SCALE), 1))
 
 
 def fingers_up(lm):
@@ -118,7 +163,7 @@ def render_strokes(strokes, grabbed=None):
     """Draw all strokes onto a black layer and return it."""
     layer = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
     if grabbed is not None:  # highlight halo under the grabbed stroke
-        draw_one(layer, grabbed, (200, 200, 200), extra=8)
+        draw_one(layer, grabbed, GRUV["fg"], extra=8)
     for s in strokes:
         draw_one(layer, s, s["color"])
     return layer
@@ -133,23 +178,144 @@ def draw_one(layer, s, color, extra=0):
         cv2.polylines(layer, [pts], False, color, size, cv2.LINE_AA)
 
 
+# --- styling helpers -----------------------------------------------------------------
+
+def style_feed(frame, tint):
+    """Desaturate the camera a bit and sink it toward gruvbox bg0 so strokes pop."""
+    gray = cv2.cvtColor(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+    frame = cv2.addWeighted(frame, 1 - FEED_DESAT, gray, FEED_DESAT, 0)
+    return cv2.addWeighted(frame, FEED_DIM, tint, 1 - FEED_DIM, 0)
+
+
+def add_glow(frame, layer):
+    """Soft warm halo around strokes (blurred at 1/4 size, so it's cheap)."""
+    small = cv2.resize(layer, (WIDTH // 4, HEIGHT // 4), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), 3 * SCALE)
+    glow = cv2.resize(small, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+    return cv2.addWeighted(frame, 1.0, glow, GLOW_STRENGTH, 0)
+
+
+def fill_rounded(img, r, color):
+    """Fill an entire image/ROI with a rounded rectangle of `color`."""
+    h, w = img.shape[:2]
+    r = max(min(r, h // 2, w // 2), 0)
+    cv2.rectangle(img, (r, 0), (w - 1 - r, h - 1), color, -1)
+    cv2.rectangle(img, (0, r), (w - 1, h - 1 - r), color, -1)
+    for cx, cy in ((r, r), (w - 1 - r, r), (r, h - 1 - r), (w - 1 - r, h - 1 - r)):
+        cv2.circle(img, (cx, cy), r, color, -1, cv2.LINE_AA)
+
+
+def panel(frame, x0, y0, x1, y1, r, color, alpha, content=None):
+    """Translucent rounded panel. `content(overlay)` can paint extra stuff onto it."""
+    roi = frame[y0:y1, x0:x1]
+    over = roi.copy()
+    fill_rounded(over, r, color)
+    if content is not None:
+        content(over)
+    frame[y0:y1, x0:x1] = cv2.addWeighted(over, alpha, roi, 1 - alpha, 0)
+
+
+def text_centered(frame, text, cx, y, scale, color, thick=1):
+    (tw, _), _ = cv2.getTextSize(text, FONT, scale, thick)
+    cv2.putText(frame, text, (cx - tw // 2, y), FONT, scale, color, thick, cv2.LINE_AA)
+
+
 def draw_toolbar(frame, selected):
+    s = SCALE
     n = len(TOOLS)
     w = WIDTH // n
+    bar = frame[0:TOOLBAR_H]
+    frame[0:TOOLBAR_H] = cv2.addWeighted(np.full_like(bar, GRUV["bg1"]), 0.82, bar, 0.18, 0)
+    cv2.line(frame, (0, TOOLBAR_H), (WIDTH, TOOLBAR_H), GRUV["bg2"], max(int(2 * s), 1), cv2.LINE_AA)
     for i, (name, color) in enumerate(TOOLS):
         x0, x1 = i * w, (i + 1) * w
-        cv2.rectangle(frame, (x0, 0), (x1, TOOLBAR_H), (40, 40, 40), -1)
-        s = SCALE
         cx = x0 + w // 2
-        if color is not None:
-            cv2.circle(frame, (cx, int(35 * s)), int(22 * s), color, -1, cv2.LINE_AA)
-        else:
-            cv2.rectangle(frame, (cx - int(22 * s), int(13 * s)), (cx + int(22 * s), int(57 * s)),
-                          (200, 200, 200), 2)
-        cv2.putText(frame, name, (cx - int(30 * s), int(80 * s)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, (230, 230, 230), 1, cv2.LINE_AA)
+        cy = int(36 * s)
         if i == selected:
-            cv2.rectangle(frame, (x0 + 3, 3), (x1 - 3, TOOLBAR_H - 3), (255, 255, 255), 3)
+            panel(frame, x0 + int(10 * s), int(6 * s), x1 - int(10 * s), TOOLBAR_H - int(6 * s),
+                  int(16 * s), GRUV["bg2"], 0.95)
+        if color is not None:
+            cv2.circle(frame, (cx, cy), int(19 * s), color, -1, cv2.LINE_AA)
+            ring = GRUV["fg"] if i == selected else GRUV["gray"]
+            cv2.circle(frame, (cx, cy), int(25 * s), ring, 2 if i == selected else 1, cv2.LINE_AA)
+        else:
+            cv2.rectangle(frame, (cx - int(19 * s), cy - int(19 * s)),
+                          (cx + int(19 * s), cy + int(19 * s)), GRUV["fg"], 2, cv2.LINE_AA)
+        label_col = GRUV["fg"] if i == selected else GRUV["gray"]
+        text_centered(frame, name, cx, int(80 * s), 0.5 * s, label_col, 1)
+
+
+def draw_cursor(frame, cur, color):
+    """Fingertip cursor; its look tells you which mode you're in."""
+    if cur is None:
+        return
+    x, y, kind, r = cur
+    s = SCALE
+    dot = max(int(3 * s), 2)
+    if kind == "draw":
+        cv2.circle(frame, (x, y), r // 2 + int(9 * s), color, 2, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), dot, GRUV["fg"], -1, cv2.LINE_AA)
+    elif kind == "erase":
+        cv2.circle(frame, (x, y), r, GRUV["fg"], 2, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), dot, GRUV["fg"], -1, cv2.LINE_AA)
+    elif kind == "hover":
+        cv2.circle(frame, (x, y), int(15 * s), GRUV["yellow"], 2, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), dot, GRUV["yellow"], -1, cv2.LINE_AA)
+    elif kind == "grab":
+        cv2.circle(frame, (x, y), int(18 * s), GRUV["orange"], 3, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), dot, GRUV["orange"], -1, cv2.LINE_AA)
+    else:  # pinch with nothing grabbed
+        cv2.circle(frame, (x, y), int(13 * s), GRUV["purple"], 2, cv2.LINE_AA)
+
+
+def draw_hud(frame, mode, brush, n_strokes, color):
+    s = SCALE
+    name = mode.split(" (")[0]
+    mcol = MODE_COLORS.get(name, GRUV["gray"])
+    fs = 0.6 * s
+    items = [name, f"brush {brush}", f"strokes {n_strokes}"]
+    widths = [cv2.getTextSize(t, FONT, fs, 1)[0][0] for t in items]
+    th = cv2.getTextSize("Ag", FONT, fs, 1)[0][1]
+    pad, gap, dot = int(16 * s), int(26 * s), int(7 * s)
+    h = int(44 * s)
+    pw = h - 8                                   # brush preview box
+    x_dot = pad + dot
+    x_name = x_dot + dot + int(10 * s)
+    x_prev = x_name + widths[0] + gap
+    x_brush = x_prev + pw + int(8 * s)
+    x_strokes = x_brush + widths[1] + gap
+    total = x_strokes + widths[2] + pad
+
+    x0, y1 = int(18 * s), HEIGHT - int(18 * s)
+    y0 = y1 - h
+    panel(frame, x0, y0, x0 + total, y1, h // 2, GRUV["bg1"], 0.82)
+
+    cy = y0 + h // 2
+    ty = cy + th // 2
+    cv2.circle(frame, (x0 + x_dot, cy), dot, mcol, -1, cv2.LINE_AA)
+    cv2.putText(frame, name, (x0 + x_name, ty), FONT, fs, GRUV["fg"], 1, cv2.LINE_AA)
+    cv2.circle(frame, (x0 + x_prev + pw // 2, cy), max(min(brush // 2, pw // 2), 1),
+               color if color is not None else GRUV["fg"], -1, cv2.LINE_AA)
+    cv2.putText(frame, items[1], (x0 + x_brush, ty), FONT, fs, GRUV["gray"], 1, cv2.LINE_AA)
+    cv2.putText(frame, items[2], (x0 + x_strokes, ty), FONT, fs, GRUV["gray"], 1, cv2.LINE_AA)
+
+
+def draw_hints(frame, a):
+    """Key hints, bottom right. `a` is 0..1 opacity (fades out)."""
+    if a <= 0:
+        return
+    s = SCALE
+    text = "s save    c clear    u undo    + / -  brush    h hints    q quit"
+    fs = 0.55 * s
+    (tw, th), _ = cv2.getTextSize(text, FONT, fs, 1)
+    pad, h = int(18 * s), int(40 * s)
+    x1, y1 = WIDTH - int(18 * s), HEIGHT - int(18 * s)
+    x0, y0 = x1 - tw - 2 * pad, y1 - h
+
+    def content(over):
+        cv2.putText(over, text, (pad, h // 2 + th // 2), FONT, fs, GRUV["fg"], 1, cv2.LINE_AA)
+
+    panel(frame, x0, y0, x1, y1, h // 2, GRUV["bg1"], 0.85 * a, content)
 
 
 def main():
@@ -161,8 +327,8 @@ def main():
     # MJPG must be set BEFORE the size: most webcams only offer 720p/1080p at 30fps in MJPG,
     # and fall back to blurry low-res / low-fps raw formats otherwise.
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
     cap.set(cv2.CAP_PROP_FPS, 30)
     cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)          # less lag
@@ -191,6 +357,8 @@ def main():
     brush = int(8 * SCALE)
     smooth = None
     clear_started = None
+    tint = np.full((HEIGHT, WIDTH, 3), GRUV["bg0"], dtype=np.uint8)
+    hints_until = time.time() + HINT_SECONDS
 
     with mp_hands.Hands(
         max_num_hands=1,
@@ -202,21 +370,26 @@ def main():
             ok, frame = cap.read()
             if not ok:
                 break
-            frame = cv2.flip(frame, 1)
-            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+            cam = cv2.flip(frame, 1)
 
-            # track on a small copy (faster, landmarks are normalized so it doesn't matter);
-            # the full-resolution frame is what you see on screen
-            small = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
+            # track on a small copy (faster, landmarks are normalized so it doesn't matter)
+            small = cv2.resize(cam, (640, 360), interpolation=cv2.INTER_AREA)
             rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             result = hands.process(rgb)
 
+            # what you see: a plain gruvbox canvas (or the tinted camera if SHOW_CAMERA)
+            if SHOW_CAMERA:
+                frame = style_feed(cv2.resize(cam, (WIDTH, HEIGHT)), tint)
+            else:
+                frame = tint.copy()
+
             mode = "NO HAND"
             erasing_now = False
+            cursor = None                     # (x, y, kind, radius) drawn after the strokes
             if result.multi_hand_landmarks:
                 hand = result.multi_hand_landmarks[0]
                 lm = hand.landmark
-                mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+                mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS, LM_SPEC, CONN_SPEC)
 
                 # --- pinch detection (thumb tip 4 vs index tip 8, scaled by hand size) ---
                 p4 = np.array([lm[4].x * WIDTH, lm[4].y * HEIGHT])
@@ -262,10 +435,10 @@ def main():
                             pt[0] += delta[0]
                             pt[1] += delta[1]
                         last_pos = smooth.copy()
-                        cv2.circle(frame, (x, y), 16, (255, 255, 255), 3)
+                        cursor = (x, y, "grab", 0)
                     else:
                         mode = "PINCH (nothing grabbed)"
-                        cv2.circle(frame, (x, y), 12, (120, 120, 120), 2)
+                        cursor = (x, y, "pinch", 0)
                 else:
                     grabbed = None
                     last_pos = None
@@ -277,7 +450,7 @@ def main():
                         mode = "HOVER"
                         clear_started = None
                         current = None
-                        cv2.circle(frame, (x, y), 14, (255, 255, 255), 2)
+                        cursor = (x, y, "hover", 0)
                         if y < TOOLBAR_H:
                             selected = min(x // (WIDTH // len(TOOLS)), len(TOOLS) - 1)
                     elif idx and not mid and not ring and not pinky:
@@ -295,14 +468,14 @@ def main():
                                 erase_prev = p1
                                 erasing_now = True
                                 current = None
-                                cv2.circle(frame, (x, y), r, (200, 200, 200), 2)
+                                cursor = (x, y, "erase", r)
                             else:
                                 if current is None:
                                     push_history(history, strokes)
                                     current = {"pts": [], "color": color, "size": brush}
                                     strokes.append(current)
                                 add_point(current, x, y)
-                                cv2.circle(frame, (x, y), brush // 2 + 2, color, -1)
+                                cursor = (x, y, "draw", brush)
                         else:
                             current = None
                     else:
@@ -320,16 +493,19 @@ def main():
             if not erasing_now:
                 erase_prev = None
 
-            # blend strokes over the video
+            # blend strokes over the video (glow first, then the crisp strokes on top)
             layer = render_strokes(strokes, grabbed)
+            if strokes:
+                frame = add_glow(frame, layer)
             gray = cv2.cvtColor(layer, cv2.COLOR_BGR2GRAY)
             mask = gray > 0
             frame[mask] = layer[mask]
 
+            cur_color = TOOLS[selected][1]
+            draw_cursor(frame, cursor, cur_color)
             draw_toolbar(frame, selected)
-            cv2.putText(frame, f"Mode: {mode}   Brush: {brush}   Strokes: {len(strokes)}",
-                        (10, HEIGHT - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (255, 255, 255), 2, cv2.LINE_AA)
+            draw_hud(frame, mode, brush, len(strokes), cur_color)
+            draw_hints(frame, min(max((hints_until - time.time()) / 2.0, 0.0), 1.0))
 
             cv2.imshow("Air Draw", frame)
             key = cv2.waitKey(1) & 0xFF
@@ -351,6 +527,8 @@ def main():
                 name = datetime.now().strftime("airdraw_%Y%m%d_%H%M%S.png")
                 cv2.imwrite(name, out)
                 print("Saved", name)
+            elif key == ord("h"):
+                hints_until = time.time() + HINT_SECONDS
             elif key in (ord("+"), ord("=")):
                 brush = min(brush + 2, 40)
             elif key in (ord("-"), ord("_")):
